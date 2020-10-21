@@ -19,6 +19,8 @@ struct NNPolicy{P <: Union{MDP, POMDP}, Q, A} <: AbstractNNPolicy
     qnetwork::Q
     action_map::Vector{A}
     n_input_dims::Int64
+    sample_prob::Bool
+    action_probability::Function
 end
 
 function getnetwork(policy::NNPolicy)
@@ -35,10 +37,27 @@ function _action(policy::NNPolicy{P,Q,A}, o::AbstractArray{T, N}) where {P<:Unio
     if ndims(o) == policy.n_input_dims
         obatch = reshape(o, (size(o)...,1))
         vals = policy.qnetwork(obatch)
-        return policy.action_map[argmax(vals)]
-    else 
+        if policy.sample_prob
+            aprobs =  dropdims(policy.action_probability(obatch), dims = 2)
+            probs = aprobs .* dropdims(vals, dims = 2)
+            probs = (sum(probs) == 0) ? aprobs : probs ./ sum(probs)
+            policy.action_map[rand(Categorical(probs))]
+        else
+            return policy.action_map[argmax(vals)]
+        end
+    else
         throw("NNPolicyError: was expecting an array with $(policy.n_input_dims) dimensions, got $(ndims(o))")
     end
+end
+
+function Distributions.logpdf(policy::NNPolicy{P,Q,A}, o, a) where {P<:Union{MDP,POMDP},Q,A}
+    @assert policy.sample_prob
+    obatch = reshape(o, (size(o)...,1))
+    vals = policy.qnetwork(obatch)
+    aprobs =  dropdims(policy.action_probability(obatch), dims = 2)
+    probs = aprobs .* dropdims(vals, dims = 2)
+    probs = (sum(probs) == 0) ? aprobs : probs ./ sum(probs)
+    log(probs[findfirst(policy.action_map .== [a])])
 end
 
 function _actionvalues(policy::NNPolicy{P,Q,A}, o::AbstractArray{T,N}) where {P<:Union{MDP,POMDP},Q,A,T<:Real,N}
@@ -53,8 +72,13 @@ end
 function _value(policy::NNPolicy{P}, o::AbstractArray{T,N}) where {P<:Union{MDP,POMDP},T<:Real,N}
     if ndims(o) == policy.n_input_dims
         obatch = reshape(o, (size(o)...,1))
-        return maximum(policy.qnetwork(obatch))
-    else 
+        vals = policy.qnetwork(obatch)
+        if policy.sample_prob
+            return sum(policy.action_probability(obatch) .* vals)
+        else
+            return maximum(vals)
+        end
+    else
         throw("NNPolicyError: was expecting an array with $(policy.n_input_dims) dimensions, got $(ndims(o))")
     end
 end

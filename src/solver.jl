@@ -25,6 +25,8 @@
     save_freq::Int64 = 3000
     log_freq::Int64 = 100
     verbose::Bool = true
+    policy_eval::Bool = false
+    action_probability::Function = (s) -> throw(error("action_probability not implemented"))
 end
 
 function POMDPs.solve(solver::DeepQLearningSolver, problem::MDP)
@@ -51,7 +53,7 @@ function POMDPs.solve(solver::DeepQLearningSolver, env::AbstractEnvironment)
     else
         active_q = solver.qnetwork
     end
-    policy = NNPolicy(env.problem, active_q, action_map, length(obs_dimensions(env)))
+    policy = NNPolicy(env.problem, active_q, action_map, length(obs_dimensions(env)), solver.policy_eval, solver.action_probability)
 
     return dqn_train!(solver, env, policy, replay)
 end
@@ -192,30 +194,42 @@ function batch_train!(solver::DeepQLearningSolver,
                       replay::PrioritizedReplayBuffer)
 
     s_batch, a_batch, r_batch, sp_batch, done_batch, indices, importance_weights = sample(replay)
-   
-    active_q = getnetwork(policy) 
-    p = params(active_q)
+
+    active_q = getnetwork(policy)
+    p = Flux.params(active_q)
 
     loss_val = nothing
     td_vals = nothing
 
     γ = convert(Float32, discount(env.problem))
-    if solver.double_q
-        qp_values = active_q(sp_batch)
-        target_q_values = target_q(sp_batch)
-        best_a = [CartesianIndex(argmax(qp_values[:, i]), i) for i=1:solver.batch_size]
-        q_sp_max = target_q_values[best_a]
+    if solver.policy_eval
+        if solver.double_q
+            throw(error("policy eval and double_q learning don't mix"))
+        else
+            target_q_values = target_q(sp_batch) # Na x B
+            a_prob = solver.action_probability(sp_batch) # Na x B
+            q_sp_max = dropdims(sum(a_prob .* target_q_values, dims = 1), dims = 1)
+        end
     else
-        q_sp_max = dropdims(maximum(target_q(sp_batch), dims=1), dims=1)
+        if solver.double_q
+            qp_values = active_q(sp_batch)
+            target_q_values = target_q(sp_batch)
+            best_a = [CartesianIndex(argmax(qp_values[:, i]), i) for i=1:solver.batch_size]
+            q_sp_max = target_q_values[best_a]
+        else
+            q_sp_max = dropdims(maximum(target_q(sp_batch), dims=1), dims=1)
+        end
     end
     q_targets = r_batch .+ (1f0 .- done_batch) .* γ .* q_sp_max
 
     gs = Flux.gradient(p) do 
         q_values = active_q(s_batch)
         q_sa = q_values[a_batch]
-        td_vals = q_sa .- q_targets
-        loss_val = sum(huber_loss, importance_weights.*td_vals)
-        loss_val /= solver.batch_size
+        td_vals = log.(q_sa .+ 1e-15) .- log.(q_targets .+ 1e-15)
+        # td_vals = q_sa .- q_targets
+        loss_val = Flux.msle(q_sa, q_targets)
+        # loss_val = sum(huber_loss, importance_weights.*td_vals)
+        # loss_val /= solver.batch_size
     end
     
     grad_norm = globalnorm(p, gs)
@@ -241,7 +255,7 @@ function batch_train!(solver::DeepQLearningSolver,
     Flux.reset!(active_q)
     Flux.reset!(target_q)
 
-    p = params(active_q)
+    p = Flux.params(active_q)
 
     loss_val = nothing
     td_vals = nothing
@@ -262,7 +276,7 @@ function batch_train!(solver::DeepQLearningSolver,
 
     Flux.reset!(active_q)
 
-    gs = Flux.gradient(p) do 
+    gs = Flux.gradient(p) do
         loss_val = 0f0
         for i=1:solver.trace_length
             q_values = active_q(s_batch[i])
@@ -281,7 +295,7 @@ end
 
 function save_model(solver::DeepQLearningSolver, active_q, scores_eval::Float64, saved_mean_reward::Float64, model_saved::Bool)
     if scores_eval >= saved_mean_reward
-        bson(joinpath(solver.logdir, "qnetwork.bson"), qnetwork=[w for w in params(active_q)])
+        bson(joinpath(solver.logdir, "qnetwork.bson"), qnetwork=[w for w in Flux.params(active_q)])
         if solver.verbose
             @printf("Saving new model with eval reward %1.3f \n", scores_eval)
         end

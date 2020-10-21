@@ -14,6 +14,7 @@ using RLInterface
 using LinearAlgebra
 using TensorBoardLogger: TBLogger, log_value
 using EllipsisNotation
+using Distributions
 
 export DeepQLearningSolver,
        AbstractNNPolicy,
